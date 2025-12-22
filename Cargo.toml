@@ -1,0 +1,11 @@
+[package]
+name = "scalarboard-native"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+eframe = "0.33.3"
+egui_plot = "0.34.0"
+notify = "8.2.0"
+tfrecord = { version = "0.15.0", features = ["with-serde"] }
