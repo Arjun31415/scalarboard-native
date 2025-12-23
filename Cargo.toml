@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.100"
 eframe = "0.33.3"
-egui_plot = "0.34.0"
+egui_plot = { git = "https://github.com/emilk/egui_plot", branch = "main" }
+image = "0.25.9"
 notify = "8.2.0"
 tfrecord = { version = "0.15.0", features = ["with-serde"] }

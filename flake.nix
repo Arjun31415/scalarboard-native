@@ -60,7 +60,7 @@
         ];
       in {
         devShells.default = pkgs.mkShell rec {
-          inputsFrom = [config.packages.foo];
+          inputsFrom = [config.packages.scalarboard];
           packages = with pkgs; [
             pre-commit
             mesa-demos
@@ -78,12 +78,15 @@
 
         packages =
           {
-            foo = rustPlatform.buildRustPackage {
-              pname = "foo";
+            scalarboard= rustPlatform.buildRustPackage {
+              pname = "scalarboard";
               version = "0.1.0";
               src = ./.;
               cargoLock = {
                 lockFile = ./Cargo.lock;
+                outputHashes = {
+                  "egui_plot-0.34.0" = "sha256-cRypTr1mC8IcEDgQ0i+boHd4SQJ2JQWyyWwmKgqTClY=";
+                };
               };
               GIO_MODULE_DIR = "${pkgs.glib-networking}/lib/gio/modules/";
               LD_LIBRARY_PATH = "/run/opengl-driver/lib:/run/opengl-driver-32/lib";
@@ -95,7 +98,7 @@
               buildInputs = gui_packages;
             };
           }
-          // {default = config.packages.foo;};
+          // {default = config.packages.scalarboard;};
 
         formatter = pkgs.alejandra;
       };
