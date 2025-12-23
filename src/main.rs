@@ -1,3 +1,4 @@
+use clap::Parser;
 use eframe::egui::{self, UserData, Vec2b};
 use egui_plot::{Corner, FilledArea, Legend, Line, Plot, PlotPoints};
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -11,28 +12,40 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use tfrecord::{EventIter, protobuf::event::What, protobuf::summary::value::Value::SimpleValue};
 
-// --- DATA STRUCTURES ---
+#[derive(Parser, Debug)]
+#[command(
+    author,
+    version,
+    about = "RL-Board: A high-performance TensorBoard-like viewer in Rust"
+)]
+struct Args {
+    /// The root directory containing tfevents files
+    #[arg(short, long, default_value = ".")]
+    path: String,
 
-/// Optimized with Arc<str> to prevent massive string duplication in memory
+    /// Maximum recursion depth for finding files
+    #[arg(short, long, default_value_t = 2)]
+    depth: usize,
+}
 struct ScalarPoint {
     run_name: Arc<str>,
     tag: Arc<str>,
     step: u32,
-    value: f64,
+    value: f32,
 }
 
 #[derive(Default, Debug, Clone)]
 struct MyPlotPoint {
     step: u32,
-    value: f64,
+    value: f32,
 }
 
 #[derive(Default, Debug, Clone)]
 struct BinnedData {
-    means: Vec<f64>,
+    means: Vec<f32>,
     lowers: Vec<f64>,
     uppers: Vec<f64>,
-    m2: Vec<f64>,
+    m2: Vec<f32>,
     num_elements: Vec<u32>,
     processed_upto: usize,
 }
@@ -64,7 +77,7 @@ impl BinnedData {
             let bin_idx = (p.step / bin_width) as usize;
 
             self.num_elements[bin_idx] += 1;
-            let n = self.num_elements[bin_idx] as f64;
+            let n = self.num_elements[bin_idx] as f32;
 
             let delta = p.value - self.means[bin_idx];
             self.means[bin_idx] += delta / n;
@@ -73,8 +86,8 @@ impl BinnedData {
 
             if n > 0.0 {
                 let std_dev = (self.m2[bin_idx] / n).sqrt();
-                self.uppers[bin_idx] = self.means[bin_idx] + std_dev;
-                self.lowers[bin_idx] = self.means[bin_idx] - std_dev;
+                self.uppers[bin_idx] = (self.means[bin_idx] + std_dev).into();
+                self.lowers[bin_idx] = (self.means[bin_idx] - std_dev).into();
             }
         }
         self.processed_upto = raw_data.len();
@@ -188,7 +201,7 @@ fn process_new_events(
                                 run_name: run_name.clone(),
                                 tag: val.tag.into(),
                                 step: result.step as u32,
-                                value: v as f64,
+                                value: v,
                             });
                         }
                     }
@@ -262,7 +275,7 @@ fn visit_dirs(
                                             run_name: run_name.clone(),
                                             tag: val.tag.into(),
                                             step: result.step as u32,
-                                            value: v as f64,
+                                            value: v,
                                         });
                                     }
                                 }
@@ -360,7 +373,7 @@ impl RLApp {
                 let line_points: PlotPoints = xs
                     .iter()
                     .zip(&binned.means)
-                    .map(|(&x, &y)| [x, y])
+                    .map(|(&x, &y)| [x as f64, y as f64])
                     .collect();
                 plot_ui
                     .line(Line::new(run_name.to_string(), line_points).name(run_name.to_string()));
@@ -506,15 +519,11 @@ fn save_screenshot(path: PathBuf, image: &Arc<egui::ColorImage>) {
 }
 
 fn main() -> eframe::Result<()> {
+    let args = Args::parse();
+
     eframe::run_native(
         "RL-Board Desktop",
         eframe::NativeOptions::default(),
-        Box::new(|cc| {
-            Ok(Box::new(RLApp::new(
-                cc,
-                "/home/prometheus/PythonSpace/Model-free-planner/runs/HERs".to_string(),
-                2,
-            )))
-        }),
+        Box::new(|cc| Ok(Box::new(RLApp::new(cc, args.path, args.depth)))),
     )
 }
