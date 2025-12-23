@@ -1,7 +1,7 @@
 use eframe::egui::{self, UserData, Vec2b};
 use egui_plot::{Corner, FilledArea, Legend, Line, Plot, PlotPoints};
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -11,9 +11,12 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use tfrecord::{EventIter, protobuf::event::What, protobuf::summary::value::Value::SimpleValue};
 
+// --- DATA STRUCTURES ---
+
+/// Optimized with Arc<str> to prevent massive string duplication in memory
 struct ScalarPoint {
-    run_name: String,
-    tag: String,
+    run_name: Arc<str>,
+    tag: Arc<str>,
     step: u32,
     value: f64,
 }
@@ -82,22 +85,21 @@ impl BinnedData {
 
 fn start_compute_worker(
     receiver: Receiver<ControlMsg>,
-    shared_cache: Arc<Mutex<BTreeMap<String, BTreeMap<String, BinnedData>>>>,
+    shared_cache: Arc<Mutex<BTreeMap<Arc<str>, BTreeMap<Arc<str>, BinnedData>>>>,
     is_processing: Arc<AtomicBool>,
 ) {
     thread::spawn(move || {
-        let mut raw_store: BTreeMap<String, BTreeMap<String, Vec<MyPlotPoint>>> = BTreeMap::new();
+        let mut raw_store: BTreeMap<Arc<str>, BTreeMap<Arc<str>, Vec<MyPlotPoint>>> =
+            BTreeMap::new();
         let mut current_interval = 10_000;
-        let mut pending_tags: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut pending_tags: HashSet<Arc<str>> = HashSet::new();
 
         loop {
-            // Wait for at least one message
             let first_msg = match receiver.recv() {
                 Ok(m) => m,
-                Err(_) => break, // Channel closed
+                Err(_) => break,
             };
 
-            // Collect all available messages in the buffer to process them at once
             let mut messages = vec![first_msg];
             while let Ok(extra) = receiver.try_recv() {
                 messages.push(extra);
@@ -108,15 +110,15 @@ fn start_compute_worker(
             for msg in messages {
                 match msg {
                     ControlMsg::NewPoint(p) => {
-                        let points = raw_store
+                        raw_store
                             .entry(p.tag.clone())
                             .or_default()
                             .entry(p.run_name.clone())
-                            .or_default();
-                        points.push(MyPlotPoint {
-                            step: p.step,
-                            value: p.value,
-                        });
+                            .or_default()
+                            .push(MyPlotPoint {
+                                step: p.step,
+                                value: p.value,
+                            });
                         pending_tags.insert(p.tag);
                     }
                     ControlMsg::ResetInterval(new_interval) => {
@@ -126,13 +128,8 @@ fn start_compute_worker(
                 }
             }
 
-            // Update the UI-visible cache
             if let Ok(mut cache) = shared_cache.lock() {
                 if reset_requested {
-                    eprintln!(
-                        "[Worker] Resetting cache for new interval: {}",
-                        current_interval
-                    );
                     cache.clear();
                     for (tag, runs) in &raw_store {
                         for (run_name, points) in runs {
@@ -146,7 +143,6 @@ fn start_compute_worker(
                     }
                     is_processing.store(false, Ordering::SeqCst);
                 } else {
-                    // Only update tags that actually got new points
                     for tag in pending_tags.drain() {
                         if let Some(runs) = raw_store.get(&tag) {
                             for (run_name, points) in runs {
@@ -178,10 +174,10 @@ fn process_new_events(
         if current_len > last_offset {
             let _ = file.seek(SeekFrom::Start(last_offset));
             let reader = EventIter::from_reader(file, Default::default());
-            let run_name = path
+            let run_name: Arc<str> = path
                 .parent()
                 .and_then(|p| p.file_name())
-                .map(|n| n.to_string_lossy().into_owned())
+                .map(|n| n.to_string_lossy().into())
                 .unwrap_or_else(|| "root".into());
 
             for result in reader.flatten() {
@@ -190,7 +186,7 @@ fn process_new_events(
                         if let Some(SimpleValue(v)) = val.value {
                             let _ = tx.send(ScalarPoint {
                                 run_name: run_name.clone(),
-                                tag: val.tag,
+                                tag: val.tag.into(),
                                 step: result.step as u32,
                                 value: v as f64,
                             });
@@ -204,19 +200,19 @@ fn process_new_events(
 }
 
 fn start_live_monitor(
-    root_path: &PathBuf,
+    root_path: PathBuf,
     tx: Sender<ScalarPoint>,
     offsets: Arc<Mutex<HashMap<PathBuf, u64>>>,
 ) {
     let (event_tx, event_rx) = channel();
     let mut watcher = RecommendedWatcher::new(event_tx, Config::default()).expect("Watcher fail");
     watcher
-        .watch(root_path, RecursiveMode::Recursive)
+        .watch(&root_path, RecursiveMode::Recursive)
         .expect("Watch path fail");
 
-    println!("Starting Live monitor");
-
     thread::spawn(move || {
+        // Keep watcher alive by moving it into the thread
+        let _watcher = watcher;
         for res in event_rx {
             if let Ok(event) = res {
                 if let EventKind::Modify(_) = event.kind {
@@ -253,10 +249,10 @@ fn visit_dirs(
                 let offsets_file = Arc::clone(offsets);
                 let handle = thread::spawn(move || {
                     if let Ok(reader) = EventIter::open(&path, Default::default()) {
-                        let run_name = path
+                        let run_name: Arc<str> = path
                             .parent()
                             .and_then(|p| p.file_name())
-                            .map(|n| n.to_string_lossy().into_owned())
+                            .map(|n| n.to_string_lossy().into())
                             .unwrap_or_else(|| "root".into());
                         for result in reader.flatten() {
                             if let Some(What::Summary(summary)) = result.what {
@@ -264,7 +260,7 @@ fn visit_dirs(
                                     if let Some(SimpleValue(v)) = val.value {
                                         let _ = tx_file.send(ScalarPoint {
                                             run_name: run_name.clone(),
-                                            tag: val.tag,
+                                            tag: val.tag.into(),
                                             step: result.step as u32,
                                             value: v as f64,
                                         });
@@ -283,17 +279,14 @@ fn visit_dirs(
     }
 }
 
-struct RLApp {
-    // Shared binned data from worker
-    bin_cache: Arc<Mutex<BTreeMap<String, BTreeMap<String, BinnedData>>>>,
-    // Channel to send data to worker
-    worker_tx: Sender<ControlMsg>,
-    // Channel receiving from file watchers
-    raw_receiver: Receiver<ScalarPoint>,
+// --- UI APPLICATION ---
 
-    maximized_tag: Option<String>,
+struct RLApp {
+    bin_cache: Arc<Mutex<BTreeMap<Arc<str>, BTreeMap<Arc<str>, BinnedData>>>>,
+    worker_tx: Sender<ControlMsg>,
+    raw_receiver: Receiver<ScalarPoint>,
+    maximized_tag: Option<Arc<str>>,
     step_interval: u32,
-    // Track processing state for UI
     is_processing: Arc<AtomicBool>,
 }
 
@@ -304,7 +297,6 @@ impl RLApp {
         let shared_cache = Arc::new(Mutex::new(BTreeMap::new()));
         let is_processing = Arc::new(AtomicBool::new(false));
 
-        // Start Compute Worker
         start_compute_worker(
             worker_rx,
             Arc::clone(&shared_cache),
@@ -323,7 +315,7 @@ impl RLApp {
             for h in handles {
                 let _ = h.join();
             }
-            start_live_monitor(&root_clone, tx_scan, offsets_scan);
+            start_live_monitor(root_clone, tx_scan, offsets_scan);
         });
 
         Self {
@@ -340,9 +332,9 @@ impl RLApp {
         let cache = self.bin_cache.lock().unwrap();
         let is_dark = plot_ui.ctx().style().visuals.dark_mode;
         let fill_color = if is_dark {
-            egui::Color32::from_white_alpha(30) // Subtle white for dark mode
+            egui::Color32::from_white_alpha(30)
         } else {
-            egui::Color32::from_black_alpha(25) // Subtle black for light mode
+            egui::Color32::from_black_alpha(25)
         };
 
         if let Some(runs) = cache.get(tag) {
@@ -351,7 +343,6 @@ impl RLApp {
                 if binned.means.is_empty() {
                     continue;
                 }
-
                 let xs: Vec<f64> = (0..binned.means.len())
                     .map(|i| (i as f64 * interval as f64) + (interval as f64 / 2.0))
                     .collect();
@@ -371,25 +362,26 @@ impl RLApp {
                     .zip(&binned.means)
                     .map(|(&x, &y)| [x, y])
                     .collect();
-                plot_ui.line(Line::new(run_name, line_points).name(run_name));
+                plot_ui
+                    .line(Line::new(run_name.to_string(), line_points).name(run_name.to_string()));
             }
         }
     }
 
-    fn render_thumbnail_plot(&mut self, ui: &mut egui::Ui, tag: &str) {
+    fn render_thumbnail_plot(&mut self, ui: &mut egui::Ui, tag: Arc<str>) {
         ui.allocate_ui(egui::vec2(450.0, 280.0), |ui| {
             ui.group(|ui| {
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
-                        ui.add(egui::Label::new(tag).truncate());
+                        ui.add(egui::Label::new(tag.as_ref()).truncate());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("⛶").clicked() {
-                                self.maximized_tag = Some(tag.to_string());
+                                self.maximized_tag = Some(tag.clone());
                             }
                         });
                     });
                     ui.add_space(4.0);
-                    Plot::new(tag)
+                    Plot::new(tag.as_ref())
                         .view_aspect(2.0)
                         .height(200.0)
                         .allow_drag(false)
@@ -400,7 +392,7 @@ impl RLApp {
                                 .text_style(egui::TextStyle::Small),
                         )
                         .link_axis("thumbnail_plots", Vec2b::new(true, false))
-                        .show(ui, |plot_ui| self.draw_plot_contents(plot_ui, tag));
+                        .show(ui, |plot_ui| self.draw_plot_contents(plot_ui, tag.as_ref()));
                 });
             });
         });
@@ -410,42 +402,37 @@ impl RLApp {
 impl eframe::App for RLApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let mut screenshot_path = None;
-        let mut new_points_count = 0;
-
-        // Drain the file watcher channel
+        let mut should_repaint = false;
         while let Ok(p) = self.raw_receiver.try_recv() {
-            new_points_count += 1;
             let _ = self.worker_tx.send(ControlMsg::NewPoint(p));
+            should_repaint = true;
         }
-
-        if new_points_count > 0 {
-            eprintln!("[UI] Forwarded {} points to worker", new_points_count);
+        if self.is_processing.load(Ordering::SeqCst) {
+            should_repaint = true;
         }
-
         egui::TopBottomPanel::top("controls").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Binning Interval:");
                 let slider_res = ui.add(
                     egui::Slider::new(&mut self.step_interval, 1000..=100000).logarithmic(true),
                 );
-
+                if slider_res.changed() || slider_res.dragged() {
+                    should_repaint = true;
+                }
                 if slider_res.drag_stopped() {
-                    eprintln!("[UI] Slider released: requesting reset");
                     self.is_processing.store(true, Ordering::SeqCst);
+                    should_repaint = true;
                     let _ = self
                         .worker_tx
                         .send(ControlMsg::ResetInterval(self.step_interval));
                 }
-
                 if self.is_processing.load(Ordering::SeqCst) {
-                    println!("[UI] Adding Spinner");
                     ui.add(egui::Spinner::new());
                     ui.weak("Processing...");
-                    return;
                 }
-
                 if self.maximized_tag.is_some() && ui.button("⬅ Back").clicked() {
                     self.maximized_tag = None;
+                    should_repaint = true;
                 }
             });
         });
@@ -453,25 +440,21 @@ impl eframe::App for RLApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(tag) = self.maximized_tag.clone() {
                 if ui.button("📷").on_hover_text("Export PNG").clicked() {
-                    let path = std::env::current_dir()
-                        .unwrap()
-                        .join(format!("{}.png", tag.replace("/", "_")));
-                    screenshot_path = Some(path);
+                    screenshot_path = Some(
+                        std::env::current_dir()
+                            .unwrap()
+                            .join(format!("{}.png", tag.replace("/", "_"))),
+                    );
+                    should_repaint = true;
                 }
                 Plot::new("full")
                     .legend(Legend::default())
-                    .default_x_bounds(0.0, 10e6)
-                    .show(ui, |plot_ui| self.draw_plot_contents(plot_ui, &tag));
+                    .show(ui, |plot_ui| self.draw_plot_contents(plot_ui, tag.as_ref()));
             } else {
                 let cache = self.bin_cache.lock().unwrap();
-                let mut sections: BTreeMap<String, Vec<String>> = BTreeMap::new();
+                let mut sections: BTreeMap<String, Vec<Arc<str>>> = BTreeMap::new();
                 for tag in cache.keys() {
-                    let parts: Vec<&str> = tag.split('/').collect();
-                    let section = if parts.len() > 1 {
-                        parts[..parts.len() - 1].join("/")
-                    } else {
-                        "General".into()
-                    };
+                    let section = tag.split('/').next().unwrap_or("General").to_string();
                     sections.entry(section).or_default().push(tag.clone());
                 }
                 drop(cache);
@@ -484,7 +467,7 @@ impl eframe::App for RLApp {
                             .show(ui, |ui| {
                                 ui.horizontal_wrapped(|ui| {
                                     for tag in tags {
-                                        self.render_thumbnail_plot(ui, &tag);
+                                        self.render_thumbnail_plot(ui, tag);
                                     }
                                 });
                             });
@@ -493,41 +476,39 @@ impl eframe::App for RLApp {
                 });
             }
         });
-        if let Some(path) = screenshot_path.take() {
+
+        if screenshot_path.is_some() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(UserData::default()));
         }
 
         ctx.input(|i| {
             for event in &i.raw.events {
                 if let egui::Event::Screenshot { image, .. } = event {
-                    let path = PathBuf::from("plot_export.png"); // Or use a stored path
-                    save_screenshot(path, image);
+                    save_screenshot(PathBuf::from("plot_export.png"), image);
                 }
             }
         });
-        ctx.request_repaint();
-    }
-}
-fn save_screenshot(path: PathBuf, image: &Arc<egui::ColorImage>) {
-    let size = image.size;
-    let pixels = image.as_raw(); // [r, g, b, a]
-
-    if let Some(buffer) = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(
-        size[0] as u32,
-        size[1] as u32,
-        pixels.to_vec(),
-    ) {
-        match buffer.save(&path) {
-            Ok(_) => eprintln!("Saved screenshot to: {:?}", path),
-            Err(e) => eprintln!("Failed to save screenshot: {}", e),
+        if should_repaint {
+            ctx.request_repaint();
         }
     }
 }
+
+fn save_screenshot(path: PathBuf, image: &Arc<egui::ColorImage>) {
+    let size = image.size;
+    if let Some(buffer) = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(
+        size[0] as u32,
+        size[1] as u32,
+        image.as_raw().to_vec(),
+    ) {
+        let _ = buffer.save(&path);
+    }
+}
+
 fn main() -> eframe::Result<()> {
-    let native_options = eframe::NativeOptions::default();
     eframe::run_native(
         "RL-Board Desktop",
-        native_options,
+        eframe::NativeOptions::default(),
         Box::new(|cc| {
             Ok(Box::new(RLApp::new(
                 cc,
