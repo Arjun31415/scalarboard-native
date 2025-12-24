@@ -57,6 +57,7 @@
           vulkan-tools
           libinput
           libxkbcommon
+          samply
         ];
       in {
         devShells.default = pkgs.mkShell rec {
@@ -78,7 +79,7 @@
 
         packages =
           {
-            scalarboard= rustPlatform.buildRustPackage {
+            scalarboard = rustPlatform.buildRustPackage {
               pname = "scalarboard";
               version = "0.1.0";
               src = ./.;

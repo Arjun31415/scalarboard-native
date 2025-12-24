@@ -1,4 +1,5 @@
 use clap::Parser;
+use dashmap::DashMap;
 use eframe::egui::{self, UserData, Vec2b};
 use egui_plot::{Corner, FilledArea, Legend, Line, Plot, PlotPoints};
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -11,12 +12,11 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tfrecord::{EventIter, protobuf::event::What, protobuf::summary::value::Value::SimpleValue};
-
 #[derive(Parser, Debug)]
 #[command(
     author,
     version,
-    about = "RL-Board: A high-performance TensorBoard-like viewer in Rust"
+    about = "Scalarboard: A high-performance TensorBoard-like viewer in Rust for scalars"
 )]
 struct Args {
     /// The root directory containing tfevents files
@@ -47,6 +47,8 @@ struct BinnedData {
     uppers: Vec<f64>,
     m2: Vec<f32>,
     num_elements: Vec<u32>,
+    x_coords: Vec<f64>,         // Pre-calculated x-axis values
+    line_coords: Vec<[f64; 2]>, // Pre-zipped [x, y] for Line
     processed_upto: usize,
 }
 
@@ -70,6 +72,13 @@ impl BinnedData {
             self.uppers.resize(required_bins, 0.0);
             self.m2.resize(required_bins, 0.0);
             self.num_elements.resize(required_bins, 0);
+            self.x_coords.resize(required_bins, 0.0);
+            self.line_coords.resize(required_bins, [0.0, 0.0]);
+            // Pre-calculate X coordinates for new bins
+            let interval = bin_width as f64;
+            for i in 0..required_bins {
+                self.x_coords[i] = (i as f64 * interval) + (interval / 2.0);
+            }
         }
 
         for i in self.processed_upto..raw_data.len() {
@@ -86,8 +95,11 @@ impl BinnedData {
 
             if n > 0.0 {
                 let std_dev = (self.m2[bin_idx] / n).sqrt();
+                let mean = self.means[bin_idx] as f64;
                 self.uppers[bin_idx] = (self.means[bin_idx] + std_dev).into();
                 self.lowers[bin_idx] = (self.means[bin_idx] - std_dev).into();
+                // Update the cached line point
+                self.line_coords[bin_idx] = [self.x_coords[bin_idx], mean];
             }
         }
         self.processed_upto = raw_data.len();
@@ -98,7 +110,7 @@ impl BinnedData {
 
 fn start_compute_worker(
     receiver: Receiver<ControlMsg>,
-    shared_cache: Arc<Mutex<BTreeMap<Arc<str>, BTreeMap<Arc<str>, BinnedData>>>>,
+    cache: Arc<DashMap<Arc<str>, DashMap<Arc<str>, BinnedData>>>,
     is_processing: Arc<AtomicBool>,
 ) {
     thread::spawn(move || {
@@ -141,35 +153,29 @@ fn start_compute_worker(
                 }
             }
 
-            if let Ok(mut cache) = shared_cache.lock() {
-                if reset_requested {
-                    cache.clear();
-                    for (tag, runs) in &raw_store {
-                        for (run_name, points) in runs {
-                            let binned = cache
-                                .entry(tag.clone())
-                                .or_default()
-                                .entry(run_name.clone())
-                                .or_default();
-                            binned.update_incrementally(points, current_interval);
-                        }
+            // if let Ok(mut cache) = shared_cache.lock() {
+            if reset_requested {
+                cache.clear();
+                for (tag, runs) in &raw_store {
+                    for (run_name, points) in runs {
+                        let tag_entry = cache.entry(tag.clone()).or_default();
+                        let mut binned = tag_entry.value().entry(run_name.clone()).or_default();
+                        binned.update_incrementally(points, current_interval);
                     }
-                    is_processing.store(false, Ordering::SeqCst);
-                } else {
-                    for tag in pending_tags.drain() {
-                        if let Some(runs) = raw_store.get(&tag) {
-                            for (run_name, points) in runs {
-                                let binned = cache
-                                    .entry(tag.clone())
-                                    .or_default()
-                                    .entry(run_name.clone())
-                                    .or_default();
-                                binned.update_incrementally(points, current_interval);
-                            }
+                }
+                is_processing.store(false, Ordering::SeqCst);
+            } else {
+                for tag in pending_tags.drain() {
+                    if let Some(runs) = raw_store.get(&tag) {
+                        for (run_name, points) in runs {
+                            let tag_entry = cache.entry(tag.clone()).or_default();
+                            let mut binned = tag_entry.value().entry(run_name.clone()).or_default();
+                            binned.update_incrementally(points, current_interval);
                         }
                     }
                 }
             }
+            // }
         }
     });
 }
@@ -222,6 +228,7 @@ fn start_live_monitor(
     watcher
         .watch(&root_path, RecursiveMode::Recursive)
         .expect("Watch path fail");
+    println!("Watching {}", root_path.display());
 
     thread::spawn(move || {
         // Keep watcher alive by moving it into the thread
@@ -232,6 +239,7 @@ fn start_live_monitor(
                     for path in event.paths {
                         if path.to_string_lossy().contains("tfevents") {
                             let mut offsets_map = offsets.lock().unwrap();
+                            // println!("New event in file {}", path.display());
                             process_new_events(&path, &mut *offsets_map, &tx);
                         }
                     }
@@ -295,19 +303,54 @@ fn visit_dirs(
 // --- UI APPLICATION ---
 
 struct RLApp {
-    bin_cache: Arc<Mutex<BTreeMap<Arc<str>, BTreeMap<Arc<str>, BinnedData>>>>,
+    bin_cache: Arc<DashMap<Arc<str>, DashMap<Arc<str>, BinnedData>>>,
     worker_tx: Sender<ControlMsg>,
     raw_receiver: Receiver<ScalarPoint>,
     maximized_tag: Option<Arc<str>>,
     step_interval: u32,
     is_processing: Arc<AtomicBool>,
 }
+fn get_color_for_run(run_name: &str) -> egui::Color32 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(run_name, &mut hasher);
+    let hash = std::hash::Hasher::finish(&hasher);
 
+    // Generate a color using the hash
+    // We use a golden angle approach or a simple palette selection
+    let h = (hash % 360) as f32 / 360.0;
+    let s = 0.6; // Keep saturation and value constant for look-and-feel
+    let v = 0.8;
+
+    // Simple HSV to RGB conversion
+    let c = v * s;
+    let x = c * (1.0 - ((h * 6.0) % 2.0 - 1.0).abs());
+    let m = v - c;
+
+    let (r, g, b) = if h < 1.0 / 6.0 {
+        (c, x, 0.0)
+    } else if h < 2.0 / 6.0 {
+        (x, c, 0.0)
+    } else if h < 3.0 / 6.0 {
+        (0.0, c, x)
+    } else if h < 4.0 / 6.0 {
+        (0.0, x, c)
+    } else if h < 5.0 / 6.0 {
+        (x, 0.0, c)
+    } else {
+        (c, 0.0, x)
+    };
+
+    egui::Color32::from_rgb(
+        ((r + m) * 255.0) as u8,
+        ((g + m) * 255.0) as u8,
+        ((b + m) * 255.0) as u8,
+    )
+}
 impl RLApp {
     fn new(_cc: &eframe::CreationContext<'_>, root_path: String, max_depth: usize) -> Self {
         let (raw_tx, raw_rx) = channel();
         let (worker_tx, worker_rx) = channel();
-        let shared_cache = Arc::new(Mutex::new(BTreeMap::new()));
+        let shared_cache = Arc::new(DashMap::new());
         let is_processing = Arc::new(AtomicBool::new(false));
 
         start_compute_worker(
@@ -342,41 +385,34 @@ impl RLApp {
     }
 
     fn draw_plot_contents(&self, plot_ui: &mut egui_plot::PlotUi, tag: &str) {
-        let cache = self.bin_cache.lock().unwrap();
-        let is_dark = plot_ui.ctx().style().visuals.dark_mode;
-        let fill_color = if is_dark {
-            egui::Color32::from_white_alpha(30)
-        } else {
-            egui::Color32::from_black_alpha(25)
-        };
+        // let cache = self.bin_cache.lock().unwrap();
 
-        if let Some(runs) = cache.get(tag) {
-            let interval = self.step_interval;
-            for (run_name, binned) in runs {
+        if let Some(runs) = self.bin_cache.get(tag) {
+            let mut sorted_runs: Vec<_> = runs.iter().collect();
+            sorted_runs.sort_by(|a, b| a.key().cmp(b.key()));
+            for entry in sorted_runs.iter() {
+                let run_name = entry.key();
+                let binned = entry.value();
                 if binned.means.is_empty() {
                     continue;
                 }
-                let xs: Vec<f64> = (0..binned.means.len())
-                    .map(|i| (i as f64 * interval as f64) + (interval as f64 / 2.0))
-                    .collect();
-
+                let base_color = get_color_for_run(run_name);
                 plot_ui.add(
                     FilledArea::new(
                         format!("{}_area", run_name),
-                        &xs,
+                        &binned.x_coords,
                         &binned.lowers,
                         &binned.uppers,
                     )
-                    .fill_color(fill_color),
+                    .fill_color(base_color.linear_multiply(0.15)),
                 );
 
-                let line_points: PlotPoints = xs
-                    .iter()
-                    .zip(&binned.means)
-                    .map(|(&x, &y)| [x as f64, y as f64])
-                    .collect();
-                plot_ui
-                    .line(Line::new(run_name.to_string(), line_points).name(run_name.to_string()));
+                let line_points = PlotPoints::new(binned.line_coords.clone());
+                plot_ui.line(
+                    Line::new(run_name.to_string(), line_points)
+                        .name(run_name.to_string())
+                        .color(base_color),
+                );
             }
         }
     }
@@ -423,11 +459,13 @@ impl eframe::App for RLApp {
         if self.is_processing.load(Ordering::SeqCst) {
             should_repaint = true;
         }
+
         egui::TopBottomPanel::top("controls").show(ctx, |ui| {
+            ui.style_mut().spacing.slider_width = 300.0;
             ui.horizontal(|ui| {
                 ui.label("Binning Interval:");
                 let slider_res = ui.add(
-                    egui::Slider::new(&mut self.step_interval, 1000..=100000).logarithmic(true),
+                    egui::Slider::new(&mut self.step_interval, 300..=100000).logarithmic(true),
                 );
                 if slider_res.changed() || slider_res.dragged() {
                     should_repaint = true;
@@ -464,13 +502,12 @@ impl eframe::App for RLApp {
                     .legend(Legend::default())
                     .show(ui, |plot_ui| self.draw_plot_contents(plot_ui, tag.as_ref()));
             } else {
-                let cache = self.bin_cache.lock().unwrap();
                 let mut sections: BTreeMap<String, Vec<Arc<str>>> = BTreeMap::new();
-                for tag in cache.keys() {
+                for r in self.bin_cache.iter() {
+                    let tag = r.key();
                     let section = tag.split('/').next().unwrap_or("General").to_string();
                     sections.entry(section).or_default().push(tag.clone());
                 }
-                drop(cache);
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.heading("RL-Board Desktop");
@@ -522,7 +559,7 @@ fn main() -> eframe::Result<()> {
     let args = Args::parse();
 
     eframe::run_native(
-        "RL-Board Desktop",
+        "ScalarBoard Desktop",
         eframe::NativeOptions::default(),
         Box::new(|cc| Ok(Box::new(RLApp::new(cc, args.path, args.depth)))),
     )
