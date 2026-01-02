@@ -74,13 +74,14 @@ impl BinnedData {
             self.num_elements.resize(required_bins, 0);
             self.x_coords.resize(required_bins, 0.0);
             self.line_coords.resize(required_bins, [0.0, 0.0]);
-            // Pre-calculate X coordinates for new bins
+
             let interval = bin_width as f64;
             for i in 0..required_bins {
                 self.x_coords[i] = (i as f64 * interval) + (interval / 2.0);
             }
         }
 
+        // Process the new raw points into their respective bins
         for i in self.processed_upto..raw_data.len() {
             let p = &raw_data[i];
             let bin_idx = (p.step / bin_width) as usize;
@@ -93,20 +94,25 @@ impl BinnedData {
             let delta2 = p.value - self.means[bin_idx];
             self.m2[bin_idx] += delta * delta2;
 
-            if n > 0.0 {
-                let std_dev = (self.m2[bin_idx] / n).sqrt();
-                let mean = self.means[bin_idx] as f64;
-                self.uppers[bin_idx] = (self.means[bin_idx] + std_dev).into();
-                self.lowers[bin_idx] = (self.means[bin_idx] - std_dev).into();
-                // Update the cached line point
-                self.line_coords[bin_idx] = [self.x_coords[bin_idx], mean];
+            let std_dev = (self.m2[bin_idx] / n).sqrt();
+            self.uppers[bin_idx] = (self.means[bin_idx] + std_dev).into();
+            self.lowers[bin_idx] = (self.means[bin_idx] - std_dev).into();
+            self.line_coords[bin_idx] = [self.x_coords[bin_idx], self.means[bin_idx] as f64];
+        }
+
+        // If a bin is empty, inherit the value from the previous bin
+        for i in 1..required_bins {
+            if self.num_elements[i] == 0 {
+                self.means[i] = self.means[i - 1];
+                self.lowers[i] = self.lowers[i - 1];
+                self.uppers[i] = self.uppers[i - 1];
+                self.line_coords[i] = [self.x_coords[i], self.means[i] as f64];
             }
         }
+
         self.processed_upto = raw_data.len();
     }
 }
-
-// --- BACKGROUND COMPUTE WORKER ---
 
 fn start_compute_worker(
     receiver: Receiver<ControlMsg>,
@@ -153,7 +159,6 @@ fn start_compute_worker(
                 }
             }
 
-            // if let Ok(mut cache) = shared_cache.lock() {
             if reset_requested {
                 cache.clear();
                 for (tag, runs) in &raw_store {
@@ -175,7 +180,6 @@ fn start_compute_worker(
                     }
                 }
             }
-            // }
         }
     });
 }
