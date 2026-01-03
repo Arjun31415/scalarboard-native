@@ -1,8 +1,9 @@
 use clap::Parser;
 use dashmap::DashMap;
 use eframe::egui::{self, UserData, Vec2b};
-use egui_plot::{Corner, FilledArea, Legend, Line, Plot, PlotPoints};
+use egui_plot::{Corner, FilledArea, Legend, Line, Plot};
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{Seek, SeekFrom};
@@ -33,41 +34,70 @@ struct ScalarPoint {
     step: u32,
     value: f32,
 }
-
 #[derive(Default, Debug, Clone)]
-struct MyPlotPoint {
-    step: u32,
-    value: f32,
+struct RawPoints {
+    pub coords: Vec<[f64; 2]>,
+    pub processed_upto: usize,
 }
-
+#[derive(Debug)]
+enum DataStore {
+    Binned(BinnedData),
+    Raw(RawPoints),
+}
 #[derive(Default, Debug, Clone)]
 struct BinnedData {
-    means: Vec<f32>,
-    lowers: Vec<f64>,
-    uppers: Vec<f64>,
-    m2: Vec<f32>,
-    num_elements: Vec<u32>,
+    // means: Vec<f32>,
     x_coords: Vec<f64>,         // Pre-calculated x-axis values
     line_coords: Vec<[f64; 2]>, // Pre-zipped [x, y] for Line
+    lowers: Vec<f64>,
+    uppers: Vec<f64>,
+
+    // Computation Stuff
+    m2: Vec<f32>,
+    num_elements: Vec<u32>,
     processed_upto: usize,
 }
-
+type SharedCache = Arc<DashMap<Arc<str>, DashMap<Arc<str>, DataStore>>>;
 enum ControlMsg {
     NewPoint(ScalarPoint),
     ResetInterval(u32),
 }
+impl DataStore {
+    fn update(&mut self, points: &[(u32, f32)], interval: u32, force_reset: bool) {
+        match self {
+            DataStore::Raw(raw) => {
+                let start = if force_reset { 0 } else { raw.processed_upto };
+                if force_reset {
+                    raw.coords.clear();
+                }
+
+                for i in start..points.len() {
+                    let (step, val) = points[i];
+                    raw.coords.push([step as f64, val as f64]);
+                }
+                raw.processed_upto = points.len();
+            }
+            DataStore::Binned(binned) => {
+                if force_reset {
+                    *binned = BinnedData::default();
+                }
+                binned.update_incrementally(points, interval);
+            }
+        }
+    }
+}
 
 impl BinnedData {
-    fn update_incrementally(&mut self, raw_data: &[MyPlotPoint], bin_width: u32) {
+    fn update_incrementally(&mut self, raw_data: &[(u32, f32)], bin_width: u32) {
         if raw_data.is_empty() || self.processed_upto >= raw_data.len() {
             return;
         }
 
-        let last_step = raw_data.last().unwrap().step;
+        let last_step = raw_data.last().unwrap().0;
         let required_bins = ((last_step / bin_width) + 1) as usize;
 
-        if self.means.len() < required_bins {
-            self.means.resize(required_bins, 0.0);
+        if self.lowers.len() < required_bins {
+            // self.means.resize(required_bins, 0.0);
             self.lowers.resize(required_bins, 0.0);
             self.uppers.resize(required_bins, 0.0);
             self.m2.resize(required_bins, 0.0);
@@ -84,29 +114,30 @@ impl BinnedData {
         // Process the new raw points into their respective bins
         for i in self.processed_upto..raw_data.len() {
             let p = &raw_data[i];
-            let bin_idx = (p.step / bin_width) as usize;
+            let bin_idx = (p.0 / bin_width) as usize;
 
             self.num_elements[bin_idx] += 1;
             let n = self.num_elements[bin_idx] as f32;
+            let mut mean = self.line_coords[bin_idx][1] as f32;
 
-            let delta = p.value - self.means[bin_idx];
-            self.means[bin_idx] += delta / n;
-            let delta2 = p.value - self.means[bin_idx];
+            let delta = p.1 - mean;
+            mean += delta / n;
+            let delta2 = p.1 - mean;
             self.m2[bin_idx] += delta * delta2;
 
             let std_dev = (self.m2[bin_idx] / n).sqrt();
-            self.uppers[bin_idx] = (self.means[bin_idx] + std_dev).into();
-            self.lowers[bin_idx] = (self.means[bin_idx] - std_dev).into();
-            self.line_coords[bin_idx] = [self.x_coords[bin_idx], self.means[bin_idx] as f64];
+            self.uppers[bin_idx] = (mean + std_dev).into();
+            self.lowers[bin_idx] = (mean - std_dev).into();
+            self.line_coords[bin_idx] = [self.x_coords[bin_idx], mean as f64];
         }
 
         // If a bin is empty, inherit the value from the previous bin
         for i in 1..required_bins {
             if self.num_elements[i] == 0 {
-                self.means[i] = self.means[i - 1];
+                // self.means[i] = self.means[i - 1];
                 self.lowers[i] = self.lowers[i - 1];
                 self.uppers[i] = self.uppers[i - 1];
-                self.line_coords[i] = [self.x_coords[i], self.means[i] as f64];
+                self.line_coords[i] = [self.x_coords[i], self.line_coords[i - 1][1]];
             }
         }
 
@@ -116,11 +147,11 @@ impl BinnedData {
 
 fn start_compute_worker(
     receiver: Receiver<ControlMsg>,
-    cache: Arc<DashMap<Arc<str>, DashMap<Arc<str>, BinnedData>>>,
+    cache: SharedCache,
     is_processing: Arc<AtomicBool>,
 ) {
     thread::spawn(move || {
-        let mut raw_store: BTreeMap<Arc<str>, BTreeMap<Arc<str>, Vec<MyPlotPoint>>> =
+        let mut raw_store: BTreeMap<Arc<str>, BTreeMap<Arc<str>, Vec<(u32, f32)>>> =
             BTreeMap::new();
         let mut current_interval = 10_000;
         let mut pending_tags: HashSet<Arc<str>> = HashSet::new();
@@ -146,10 +177,7 @@ fn start_compute_worker(
                             .or_default()
                             .entry(p.run_name.clone())
                             .or_default()
-                            .push(MyPlotPoint {
-                                step: p.step,
-                                value: p.value,
-                            });
+                            .push((p.step, p.value));
                         pending_tags.insert(p.tag);
                     }
                     ControlMsg::ResetInterval(new_interval) => {
@@ -160,25 +188,41 @@ fn start_compute_worker(
             }
 
             if reset_requested {
-                cache.clear();
-                for (tag, runs) in &raw_store {
-                    for (run_name, points) in runs {
-                        let tag_entry = cache.entry(tag.clone()).or_default();
-                        let mut binned = tag_entry.value().entry(run_name.clone()).or_default();
-                        binned.update_incrementally(points, current_interval);
+                raw_store.par_iter().for_each(|(tag, runs)| {
+                    if tag.starts_with("eval") {
+                        return;
                     }
-                }
+                    runs.par_iter().for_each(|(run_name, points)| {
+                        let tag_entry = cache.entry(tag.clone()).or_default();
+                        let run_map = tag_entry.value();
+                        let mut entry = run_map
+                            .entry(run_name.clone())
+                            .or_insert_with(|| DataStore::Binned(BinnedData::default()));
+                        entry.update(&points, current_interval, true);
+                    });
+                });
                 is_processing.store(false, Ordering::SeqCst);
             } else {
-                for tag in pending_tags.drain() {
+                // for tag in pending_tags.drain() {
+                //
+                pending_tags.par_drain().for_each(|tag| {
+                    let is_eval = tag.starts_with("eval");
                     if let Some(runs) = raw_store.get(&tag) {
-                        for (run_name, points) in runs {
+                        // for (run_name, points) in runs {
+                        runs.par_iter().for_each(|(run_name, points)| {
                             let tag_entry = cache.entry(tag.clone()).or_default();
-                            let mut binned = tag_entry.value().entry(run_name.clone()).or_default();
-                            binned.update_incrementally(points, current_interval);
-                        }
+                            let run_map = tag_entry.value();
+                            let mut entry = run_map.entry(run_name.clone()).or_insert_with(|| {
+                                if is_eval {
+                                    DataStore::Raw(RawPoints::default())
+                                } else {
+                                    DataStore::Binned(BinnedData::default())
+                                }
+                            });
+                            entry.update(points, current_interval, false);
+                        })
                     }
-                }
+                })
             }
         }
     });
@@ -241,9 +285,10 @@ fn start_live_monitor(
             if let Ok(event) = res {
                 if let EventKind::Modify(_) = event.kind {
                     for path in event.paths {
-                        if path.to_string_lossy().contains("tfevents") {
+                        if path.file_name().map_or(false, |name| {
+                            name.to_string_lossy().starts_with("events.out.tfevents")
+                        }) {
                             let mut offsets_map = offsets.lock().unwrap();
-                            // println!("New event in file {}", path.display());
                             process_new_events(&path, &mut *offsets_map, &tx);
                         }
                     }
@@ -259,47 +304,58 @@ fn visit_dirs(
     depth: usize,
     max_depth: usize,
     offsets: &Arc<Mutex<HashMap<PathBuf, u64>>>,
-    handles: &mut Vec<thread::JoinHandle<()>>,
 ) {
     if depth > max_depth {
         return;
     }
+
     if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
+        // Collect into a Vec so we can use par_iter
+        let entries: Vec<_> = entries.flatten().collect();
+
+        entries.into_par_iter().for_each(|entry| {
             let path = entry.path();
             if path.is_dir() {
-                visit_dirs(&path, tx, depth + 1, max_depth, offsets, handles);
+                // Recursive call within the pool
+                visit_dirs(&path, tx, depth + 1, max_depth, offsets);
             } else if path.is_file() && path.to_string_lossy().contains("tfevents") {
-                let tx_file = tx.clone();
-                let offsets_file = Arc::clone(offsets);
-                let handle = thread::spawn(move || {
-                    if let Ok(reader) = EventIter::open(&path, Default::default()) {
-                        let run_name: Arc<str> = path
-                            .parent()
-                            .and_then(|p| p.file_name())
-                            .map(|n| n.to_string_lossy().into())
-                            .unwrap_or_else(|| "root".into());
-                        for result in reader.flatten() {
-                            if let Some(What::Summary(summary)) = result.what {
-                                for val in summary.value {
-                                    if let Some(SimpleValue(v)) = val.value {
-                                        let _ = tx_file.send(ScalarPoint {
-                                            run_name: run_name.clone(),
-                                            tag: val.tag.into(),
-                                            step: result.step as u32,
-                                            value: v,
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                        if let Ok(meta) = std::fs::metadata(&path) {
-                            offsets_file.lock().unwrap().insert(path, meta.len());
-                        }
-                    }
-                });
-                handles.push(handle);
+                process_single_file(&path, tx, offsets);
             }
+        });
+    }
+}
+
+fn process_single_file(
+    path: &Path,
+    tx: &Sender<ScalarPoint>,
+    offsets: &Arc<Mutex<HashMap<PathBuf, u64>>>,
+) {
+    if let Ok(reader) = EventIter::open(path, Default::default()) {
+        let run_name: Arc<str> = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into())
+            .unwrap_or_else(|| "root".into());
+
+        for result in reader.flatten() {
+            if let Some(What::Summary(summary)) = result.what {
+                for val in summary.value {
+                    if let Some(SimpleValue(v)) = val.value {
+                        let _ = tx.send(ScalarPoint {
+                            run_name: run_name.clone(),
+                            tag: val.tag.into(),
+                            step: result.step as u32,
+                            value: v,
+                        });
+                    }
+                }
+            }
+        }
+        if let Ok(meta) = std::fs::metadata(path) {
+            offsets
+                .lock()
+                .unwrap()
+                .insert(path.to_path_buf(), meta.len());
         }
     }
 }
@@ -307,7 +363,7 @@ fn visit_dirs(
 // --- UI APPLICATION ---
 
 struct RLApp {
-    bin_cache: Arc<DashMap<Arc<str>, DashMap<Arc<str>, BinnedData>>>,
+    bin_cache: SharedCache,
     worker_tx: Sender<ControlMsg>,
     raw_receiver: Receiver<ScalarPoint>,
     maximized_tag: Option<Arc<str>>,
@@ -370,11 +426,7 @@ impl RLApp {
         let tx_scan = raw_tx.clone();
         let offsets_scan = Arc::clone(&offsets);
         thread::spawn(move || {
-            let mut handles = vec![];
-            visit_dirs(&root, &tx_scan, 0, max_depth, &offsets_scan, &mut handles);
-            for h in handles {
-                let _ = h.join();
-            }
+            visit_dirs(&root, &tx_scan, 0, max_depth, &offsets_scan);
             start_live_monitor(root_clone, tx_scan, offsets_scan);
         });
 
@@ -389,34 +441,44 @@ impl RLApp {
     }
 
     fn draw_plot_contents(&self, plot_ui: &mut egui_plot::PlotUi, tag: &str) {
-        // let cache = self.bin_cache.lock().unwrap();
-
         if let Some(runs) = self.bin_cache.get(tag) {
-            let mut sorted_runs: Vec<_> = runs.iter().collect();
-            sorted_runs.sort_by(|a, b| a.key().cmp(b.key()));
-            for entry in sorted_runs.iter() {
+            for entry in runs.iter() {
                 let run_name = entry.key();
-                let binned = entry.value();
-                if binned.means.is_empty() {
-                    continue;
-                }
                 let base_color = get_color_for_run(run_name);
-                plot_ui.add(
-                    FilledArea::new(
-                        format!("{}_area", run_name),
-                        &binned.x_coords,
-                        &binned.lowers,
-                        &binned.uppers,
-                    )
-                    .fill_color(base_color.linear_multiply(0.15)),
-                );
 
-                let line_points = PlotPoints::new(binned.line_coords.clone());
-                plot_ui.line(
-                    Line::new(run_name.to_string(), line_points)
-                        .name(run_name.to_string())
-                        .color(base_color),
-                );
+                match entry.value() {
+                    DataStore::Binned(binned) => {
+                        if binned.lowers.is_empty() {
+                            continue;
+                        }
+                        // Draw Area + Line
+                        plot_ui.add(
+                            FilledArea::new(
+                                format!("{}_area", run_name),
+                                &binned.x_coords,
+                                &binned.lowers,
+                                &binned.uppers,
+                            )
+                            .fill_color(base_color.linear_multiply(0.15)),
+                        );
+                        plot_ui.line(
+                            Line::new(run_name.to_string(), binned.line_coords.clone())
+                                .color(base_color),
+                        );
+                    }
+                    DataStore::Raw(raw) => {
+                        if raw.coords.is_empty() {
+                            continue;
+                        }
+                        // Draw a dashed line or dots for Eval data
+                        plot_ui.line(
+                            Line::new(run_name.to_string(), raw.coords.clone())
+                                .color(base_color)
+                                .style(egui_plot::LineStyle::Dashed { length: 4.0 })
+                                .name(format!("{} (eval)", run_name)),
+                        );
+                    }
+                }
             }
         }
     }

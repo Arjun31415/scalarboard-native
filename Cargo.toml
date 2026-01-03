@@ -11,4 +11,5 @@ eframe = "0.33.3"
 egui_plot = { git = "https://github.com/emilk/egui_plot", branch = "main" }
 image = { version = "0.25.9", default-features = false, features = ["png"] }
 notify = "8.2.0"
+rayon = "1.11.0"
 tfrecord = { version = "0.15.0" }

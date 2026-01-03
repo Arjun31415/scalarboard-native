@@ -1,15 +1,11 @@
 {
-  description = "foo";
+  description = "scalarboard-rs";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-parts = {
       url = "github:hercules-ci/flake-parts";
       inputs.nixpkgs-lib.follows = "nixpkgs";
-    };
-    nixgl = {
-      url = "github:guibou/nixGL";
-      inputs.nixpkgs.follows = "nixpkgs";
     };
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
@@ -25,7 +21,7 @@
         system,
         ...
       }: let
-        overlays = [(import inputs.rust-overlay) (inputs.nixgl.overlay)];
+        overlays = [(import inputs.rust-overlay)];
         pkgs = import nixpkgs {
           inherit system overlays;
         };
@@ -68,7 +64,6 @@
             vscode-extensions.llvm-org.lldb-vscode
             taplo
             glib-networking
-            # inputs.nixgl.packages.${system}.default
           ];
           LD_LIBRARY_PATH = "/run/opengl-driver/lib:/run/opengl-driver-32/lib";
           GIO_MODULE_DIR = "${pkgs.glib-networking}/lib/gio/modules/";
