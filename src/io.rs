@@ -99,7 +99,11 @@ pub fn visit_dirs(
             if path.is_dir() {
                 // Recursive call within the pool
                 visit_dirs(&path, tx, depth + 1, max_depth, offsets);
-            } else if path.is_file() && path.to_string_lossy().contains("tfevents") {
+            } else if path.is_file()
+                && path.file_name().map_or(false, |name| {
+                    name.to_string_lossy().starts_with("events.out.tfevents")
+                })
+            {
                 process_single_file(&path, tx, offsets);
             }
         });

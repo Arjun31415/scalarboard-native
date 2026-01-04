@@ -14,13 +14,13 @@ pub struct RawPoints {
 #[derive(Debug)]
 pub enum DataStore {
     Binned(BinnedData),
+    // Raw points used for eval tags
     Raw(RawPoints),
 }
 #[derive(Default, Debug, Clone)]
 pub struct BinnedData {
-    // means: Vec<f32>,
-    pub x_coords: Vec<f64>,         // Pre-calculated x-axis values
-    pub line_coords: Vec<[f64; 2]>, // Pre-zipped [x, y] for Line
+    pub x_coords: Vec<f64>,
+    pub line_coords: Vec<[f64; 2]>, // [x, y] for Line
     pub lowers: Vec<f64>,
     pub uppers: Vec<f64>,
 
@@ -71,7 +71,6 @@ impl BinnedData {
         let required_bins = ((last_step / bin_width) + 1) as usize;
 
         if self.lowers.len() < required_bins {
-            // self.means.resize(required_bins, 0.0);
             self.lowers.resize(required_bins, 0.0);
             self.uppers.resize(required_bins, 0.0);
             self.m2.resize(required_bins, 0.0);
@@ -105,10 +104,10 @@ impl BinnedData {
             self.line_coords[bin_idx] = [self.x_coords[bin_idx], mean as f64];
         }
 
-        // If a bin is empty, inherit the value from the previous bin
+        // If a bin is empty, use the value from the previous bin
+        // (linear interpolation will be better but I'm lazy and this is good enough)
         for i in 1..required_bins {
             if self.num_elements[i] == 0 {
-                // self.means[i] = self.means[i - 1];
                 self.lowers[i] = self.lowers[i - 1];
                 self.uppers[i] = self.uppers[i - 1];
                 self.line_coords[i] = [self.x_coords[i], self.line_coords[i - 1][1]];

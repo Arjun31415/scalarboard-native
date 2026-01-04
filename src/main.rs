@@ -18,7 +18,7 @@ use io::*;
 #[command(
     author = "Arjun31415",
     version = "0.0.1",
-    about = "Scalarboard: A high-performance TensorBoard-like viewer in Rust for scalars"
+    about = "ScalarBoard: A high-performance TensorBoard-like viewer in Rust for scalars"
 )]
 struct Args {
     /// The root directory containing tfevents files
@@ -74,6 +74,7 @@ fn start_compute_worker(
 
             if reset_requested {
                 raw_store.par_iter().for_each(|(tag, runs)| {
+                    // If is it is eval we dont do buckets anyways so why bother recomputing
                     if tag.starts_with("eval") {
                         return;
                     }
@@ -88,12 +89,9 @@ fn start_compute_worker(
                 });
                 is_processing.store(false, Ordering::SeqCst);
             } else {
-                // for tag in pending_tags.drain() {
-                //
                 pending_tags.par_drain().for_each(|tag| {
                     let is_eval = tag.starts_with("eval");
                     if let Some(runs) = raw_store.get(&tag) {
-                        // for (run_name, points) in runs {
                         runs.par_iter().for_each(|(run_name, points)| {
                             let tag_entry = cache.entry(tag.clone()).or_default();
                             let run_map = tag_entry.value();
@@ -123,6 +121,7 @@ struct RLApp {
     step_interval: u32,
     is_processing: Arc<AtomicBool>,
 }
+// Gemini generated because I had no idea how to do this
 fn get_color_for_run(run_name: &str) -> egui::Color32 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     std::hash::Hash::hash(run_name, &mut hasher);
@@ -204,7 +203,7 @@ impl RLApp {
                         if binned.lowers.is_empty() {
                             continue;
                         }
-                        // Draw Area + Line
+                        // Draw Area (for std deviation, lower + upper) and Line
                         plot_ui.add(
                             FilledArea::new(
                                 format!("{}_area", run_name),
@@ -223,7 +222,6 @@ impl RLApp {
                         if raw.coords.is_empty() {
                             continue;
                         }
-                        // Draw a dashed line or dots for Eval data
                         plot_ui.line(
                             Line::new(run_name.to_string(), raw.coords.clone())
                                 .color(base_color)
@@ -329,7 +327,7 @@ impl eframe::App for RLApp {
                 }
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.heading("RL-Board Desktop");
+                    ui.heading("ScalarBoard Desktop");
                     for (section_name, tags) in sections {
                         egui::CollapsingHeader::new(&section_name)
                             .default_open(true)
