@@ -16,11 +16,19 @@ tensorboard web viewer slow when I had around 10Mil data points, So I make this.
 6. Dark and Light mode
 7. Save a plot to png
 
+
 More features may be added in future if I feel the need for it, not sure about adding plotting stuff for non-scalars like images etc (primarily because I dont use that, but open to it if I need it in the future)
+
+
+<img width="1920" height="1080" alt="plot_export" src="https://github.com/user-attachments/assets/e844edf9-4bab-4d25-bae6-eba4683caf70" />
+
+<img width="1920" height="1032" alt="plot_export" src="https://github.com/user-attachments/assets/a481971f-d511-410b-bfff-3de077849a92" />
+
+
 
 # How to use - 
 
-```
+```sh
 git clone 
 cd 
 cargo run --release -- --path=<path/to/tfevents/directory>
