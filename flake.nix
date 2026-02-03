@@ -1,5 +1,5 @@
 {
-  description = "ScalarBoard: Tensorboard Alternative for Scalars only";
+  description = "ScalarBoard: Fast Native Tensorboard Scalars viewer ";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
