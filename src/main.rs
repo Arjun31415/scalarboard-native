@@ -121,7 +121,7 @@ struct RLApp {
     step_interval: u32,
     is_processing: Arc<AtomicBool>,
 }
-// Gemini generated because I had no idea how to do this
+// Gemini generated because I had no idea how to do this, still not good enough, but I'm lazy
 fn get_color_for_run(run_name: &str, is_dark: bool) -> egui::Color32 {
     // 1. Generate a stable seed from the string
     let mut h: u64 = 0x811c9dc5; // FNV offset basis
@@ -130,7 +130,7 @@ fn get_color_for_run(run_name: &str, is_dark: bool) -> egui::Color32 {
         h = h.wrapping_mul(0x100000001b3); // FNV prime
     }
 
-    // 2. The "Mixer": SplitMix64 or MurmurHash3 style
+    // 2. The "Mixer": SplitMix64 or MurmurHash3 style. Idk if this claim is true but whatever
     // It shuffles the bits so the distribution is "flat" across the 0..1 range.
     h = (h ^ (h >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
     h = (h ^ (h >> 27)).wrapping_mul(0x94d049bb133111eb);
@@ -139,7 +139,7 @@ fn get_color_for_run(run_name: &str, is_dark: bool) -> egui::Color32 {
     // 3. Convert to Hue (0.0 to 1.0)
     let golden_ratio = 0.618033988749895;
     let hue = ((h as f64 / u64::MAX as f64) + golden_ratio).fract() as f32;
-    // 4. Theme-aware Saturation and Value
+    // 4. Theme-aware Saturation and Value, only line that I understand
     let (s, v) = if is_dark { (0.7, 0.95) } else { (0.85, 0.65) };
 
     egui::Color32::from(egui::ecolor::Hsva::new(hue, s, v, 1.0))
@@ -358,6 +358,9 @@ impl eframe::App for RLApp {
             }
         });
         if should_repaint {
+            // FIXME:
+            // there is still some bug that the plots dont get auto updated if there is new data, I
+            // have to jiggle my mouse, idk what I have done wrong.
             ctx.request_repaint();
         }
     }
