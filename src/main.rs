@@ -122,41 +122,27 @@ struct RLApp {
     is_processing: Arc<AtomicBool>,
 }
 // Gemini generated because I had no idea how to do this
-fn get_color_for_run(run_name: &str) -> egui::Color32 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    std::hash::Hash::hash(run_name, &mut hasher);
-    let hash = std::hash::Hasher::finish(&hasher);
+fn get_color_for_run(run_name: &str, is_dark: bool) -> egui::Color32 {
+    // 1. Generate a stable seed from the string
+    let mut h: u64 = 0x811c9dc5; // FNV offset basis
+    for byte in run_name.bytes() {
+        h ^= byte as u64;
+        h = h.wrapping_mul(0x100000001b3); // FNV prime
+    }
 
-    // Generate a color using the hash
-    // We use a golden angle approach or a simple palette selection
-    let h = (hash % 360) as f32 / 360.0;
-    let s = 0.6; // Keep saturation and value constant for look-and-feel
-    let v = 0.8;
+    // 2. The "Mixer": SplitMix64 or MurmurHash3 style
+    // It shuffles the bits so the distribution is "flat" across the 0..1 range.
+    h = (h ^ (h >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    h = (h ^ (h >> 27)).wrapping_mul(0x94d049bb133111eb);
+    h = h ^ (h >> 31);
 
-    // Simple HSV to RGB conversion
-    let c = v * s;
-    let x = c * (1.0 - ((h * 6.0) % 2.0 - 1.0).abs());
-    let m = v - c;
+    // 3. Convert to Hue (0.0 to 1.0)
+    let golden_ratio = 0.618033988749895;
+    let hue = ((h as f64 / u64::MAX as f64) + golden_ratio).fract() as f32;
+    // 4. Theme-aware Saturation and Value
+    let (s, v) = if is_dark { (0.7, 0.95) } else { (0.85, 0.65) };
 
-    let (r, g, b) = if h < 1.0 / 6.0 {
-        (c, x, 0.0)
-    } else if h < 2.0 / 6.0 {
-        (x, c, 0.0)
-    } else if h < 3.0 / 6.0 {
-        (0.0, c, x)
-    } else if h < 4.0 / 6.0 {
-        (0.0, x, c)
-    } else if h < 5.0 / 6.0 {
-        (x, 0.0, c)
-    } else {
-        (c, 0.0, x)
-    };
-
-    egui::Color32::from_rgb(
-        ((r + m) * 255.0) as u8,
-        ((g + m) * 255.0) as u8,
-        ((b + m) * 255.0) as u8,
-    )
+    egui::Color32::from(egui::ecolor::Hsva::new(hue, s, v, 1.0))
 }
 impl RLApp {
     fn new(_cc: &eframe::CreationContext<'_>, root_path: String, max_depth: usize) -> Self {
@@ -193,10 +179,11 @@ impl RLApp {
     }
 
     fn draw_plot_contents(&self, plot_ui: &mut egui_plot::PlotUi, tag: &str) {
+        let is_dark = plot_ui.ctx().style().visuals.dark_mode;
         if let Some(runs) = self.bin_cache.get(tag) {
             for entry in runs.iter() {
                 let run_name = entry.key();
-                let base_color = get_color_for_run(run_name);
+                let base_color = get_color_for_run(run_name, is_dark);
 
                 match entry.value() {
                     DataStore::Binned(binned) => {
@@ -215,7 +202,8 @@ impl RLApp {
                         );
                         plot_ui.line(
                             Line::new(run_name.to_string(), binned.line_coords.clone())
-                                .color(base_color),
+                                .color(base_color)
+                                .width(2.0),
                         );
                     }
                     DataStore::Raw(raw) => {
@@ -280,6 +268,8 @@ impl eframe::App for RLApp {
         egui::TopBottomPanel::top("controls").show(ctx, |ui| {
             ui.style_mut().spacing.slider_width = 300.0;
             ui.horizontal(|ui| {
+                egui::widgets::global_theme_preference_buttons(ui);
+                ui.separator();
                 ui.label("Binning Interval:");
                 let slider_res = ui.add(
                     egui::Slider::new(&mut self.step_interval, 300..=100000).logarithmic(true),
@@ -287,7 +277,7 @@ impl eframe::App for RLApp {
                 if slider_res.changed() || slider_res.dragged() {
                     should_repaint = true;
                 }
-                if slider_res.drag_stopped() {
+                if slider_res.changed() {
                     self.is_processing.store(true, Ordering::SeqCst);
                     should_repaint = true;
                     let _ = self
@@ -317,6 +307,18 @@ impl eframe::App for RLApp {
                 }
                 Plot::new("full")
                     .legend(Legend::default())
+                    .x_axis_label(egui::RichText::new("Step").size(20.0).strong())
+                    .y_axis_label(
+                        egui::RichText::new(
+                            tag.as_ref()
+                                .split("/")
+                                .last()
+                                .or(Some(tag.as_ref()))
+                                .unwrap(),
+                        )
+                        .size(20.0)
+                        .strong(),
+                    )
                     .show(ui, |plot_ui| self.draw_plot_contents(plot_ui, tag.as_ref()));
             } else {
                 let mut sections: BTreeMap<String, Vec<Arc<str>>> = BTreeMap::new();
