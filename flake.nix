@@ -81,7 +81,7 @@
               cargoLock = {
                 lockFile = ./Cargo.lock;
                 outputHashes = {
-                  "egui_plot-0.34.0" = "sha256-cRypTr1mC8IcEDgQ0i+boHd4SQJ2JQWyyWwmKgqTClY=";
+                  "egui_plot-0.34.1" = "sha256-cRypTr1mC8IcEDgQ0i+boHd4SQJ2JQWyyWwmKgqTClY=";
                 };
               };
               GIO_MODULE_DIR = "${pkgs.glib-networking}/lib/gio/modules/";
