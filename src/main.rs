@@ -1,5 +1,9 @@
 use clap::Parser;
 use dashmap::DashMap;
+extern crate jemallocator;
+#[global_allocator]
+static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
+
 use eframe::egui::{self, UserData, Vec2b};
 use egui_plot::{Corner, FilledArea, Legend, Line, Plot};
 use rayon::prelude::*;
@@ -75,9 +79,9 @@ fn start_compute_worker(
             if reset_requested {
                 raw_store.par_iter().for_each(|(tag, runs)| {
                     // If is it is eval we dont do buckets anyways so why bother recomputing
-                    if tag.starts_with("eval") {
-                        return;
-                    }
+                    // if tag.starts_with("eval") {
+                    //     return;
+                    // }
                     runs.par_iter().for_each(|(run_name, points)| {
                         let tag_entry = cache.entry(tag.clone()).or_default();
                         let run_map = tag_entry.value();
@@ -90,7 +94,8 @@ fn start_compute_worker(
                 is_processing.store(false, Ordering::SeqCst);
             } else {
                 pending_tags.par_drain().for_each(|tag| {
-                    let is_eval = tag.starts_with("eval");
+                    // let is_eval = tag.starts_with("eval");
+                    let is_eval = false;
                     if let Some(runs) = raw_store.get(&tag) {
                         runs.par_iter().for_each(|(run_name, points)| {
                             let tag_entry = cache.entry(tag.clone()).or_default();
@@ -214,6 +219,7 @@ impl RLApp {
                             Line::new(run_name.to_string(), raw.coords.clone())
                                 .color(base_color)
                                 .style(egui_plot::LineStyle::Dashed { length: 4.0 })
+                                .width(2.0)
                                 .name(format!("{} (eval)", run_name)),
                         );
                     }
