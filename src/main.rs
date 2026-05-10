@@ -278,7 +278,7 @@ impl eframe::App for RLApp {
                 ui.separator();
                 ui.label("Binning Interval:");
                 let slider_res = ui.add(
-                    egui::Slider::new(&mut self.step_interval, 300..=100000).logarithmic(true),
+                    egui::Slider::new(&mut self.step_interval, 100..=100000).logarithmic(true),
                 );
                 if slider_res.changed() || slider_res.dragged() {
                     should_repaint = true;

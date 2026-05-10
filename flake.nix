@@ -56,7 +56,7 @@
           samply
         ];
       in {
-        devShells.default = pkgs.mkShell rec {
+        devShells.default = pkgs.mkShell {
           inputsFrom = [config.packages.scalarboard];
           packages = with pkgs; [
             pre-commit
